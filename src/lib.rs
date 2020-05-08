@@ -73,9 +73,10 @@ impl<T> Nodes<T> {
         }
     }
 
-    fn add_parameter_node(&mut self) -> &mut ParameterNode<T> {
-        self.parameter = Some(Box::new(ParameterNode::default()));
-        self.parameter.as_mut().unwrap()
+    fn add_parameter_node(&mut self, can_be_empty: bool) -> &mut ParameterNode<T> {
+        let out = self.parameter.get_or_insert_with(|| Box::new(ParameterNode::default()));
+        out.can_be_empty = out.can_be_empty || can_be_empty;
+        out
     }
 
     fn get(&self, key: &[u8]) -> Option<NodeRef<T>> {
@@ -132,18 +133,20 @@ struct ParameterNode<T> {
     data: Option<T>,
     nodes: Nodes<T>,
     params: Option<Vec<BString>>,
-    delimiter: Option<BString>,
+    delimiters: Option<Vec<BString>>,
+    can_be_empty: bool,
 }
 
 impl<T> Default for ParameterNode<T> {
     fn default() -> Self {
-        Self { data: None, nodes: Nodes::default(), params: None, delimiter: None }
+        Self { data: None, nodes: Nodes::default(), params: None, delimiters: None, can_be_empty: false, }
     }
 }
 
 impl<T> ParameterNode<T> {
-    fn set_delimiter<U: AsRef<[u8]>>(&mut self, delimiter: U) {
-        self.delimiter = Some(delimiter.as_ref().replace("{{", "{").replace("}}", "}").into());
+    fn add_delimiter<U: AsRef<[u8]>>(&mut self, delimiter: U) {
+        let mut delimiters = self.delimiters.get_or_insert_with(Vec::new);
+        delimiters.push(delimiter.as_ref().replace("{{", "{").replace("}}", "}").into());
     }
 }
 
@@ -155,7 +158,7 @@ enum Node<T> {
 
 trait NodeMut<T> {
     fn add_static_node<'b>(&mut self, path_first: u8, path: &'b [u8]) -> &mut StaticNode<T>;
-    fn add_parameter_node(&mut self) -> &mut ParameterNode<T>;
+    fn add_parameter_node(&mut self, can_be_empty: bool) -> &mut ParameterNode<T>;
     fn set_data(&mut self, data: Option<T>);
     fn set_params(&mut self, params: Option<Vec<BString>>);
     fn as_mut_parameter_node(&mut self) -> Option<&mut ParameterNode<T>> { None }
@@ -165,8 +168,8 @@ impl<T> NodeMut<T> for StaticNode<T> {
     fn add_static_node<'b>(&mut self, path_first: u8, path: &'b [u8]) -> &mut StaticNode<T> {
         self.nodes.add_static_node(path_first, path)
     }
-    fn add_parameter_node(&mut self) -> &mut ParameterNode<T> {
-        self.nodes.add_parameter_node()
+    fn add_parameter_node(&mut self, can_be_empty: bool) -> &mut ParameterNode<T> {
+        self.nodes.add_parameter_node(can_be_empty)
     }
     fn set_data(&mut self, data: Option<T>) { self.data = data; }
     fn set_params(&mut self, params: Option<Vec<BString>>) { self.params = params; }
@@ -176,8 +179,8 @@ impl<T> NodeMut<T> for ParameterNode<T> {
     fn add_static_node<'b>(&mut self, path_first: u8, path: &'b [u8]) -> &mut StaticNode<T> {
         self.nodes.add_static_node(path_first, path)
     }
-    fn add_parameter_node(&mut self) -> &mut ParameterNode<T> {
-        self.nodes.add_parameter_node()
+    fn add_parameter_node(&mut self, can_be_empty: bool) -> &mut ParameterNode<T> {
+        self.nodes.add_parameter_node(can_be_empty)
     }
     fn set_data(&mut self, data: Option<T>) { self.data = data; }
     fn set_params(&mut self, params: Option<Vec<BString>>) { self.params = params; }
@@ -237,20 +240,35 @@ impl<'a, T> NodeRef<'a, T> {
                 }
             }
             Self::Parameter(ref node) => {
-                if let Some(del) = node.delimiter.as_ref() {
-                    if let Some(idx) = path.find(del) {
-                        params.push(&path[..idx]);
-                        path = &path[idx..];
-                        if let Some((n, mut ps)) = node.nodes.get(&path)
-                            .and_then(|n| n.find(path) ) {
-                            params.append(&mut ps);
-                            Some((n, params))
+                if let Some(dels) = node.delimiters.as_ref() {
+                    dels.iter().filter_map(|del| {
+                        if let Some(idx) = path.find(del) {
+                            let mut params = params.clone();
+
+                            params.push(&path[..idx]);
+                            path = &path[idx..];
+                            if let Some((n, mut ps)) = node.nodes.get(&path)
+                                .and_then(|n| n.find(path) ) {
+                                params.append(&mut ps);
+                                Some((n, params))
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
-                    } else {
-                        None
-                    }
+                    }).next().or_else(|| {
+                        if node.can_be_empty {
+                            let mut params = params.clone();
+                            params.push(path);
+                            Some((
+                                NodeRef::Parameter(node),
+                                params,
+                            ))
+                        } else {
+                            None
+                        }
+                    })
                 } else {
                     params.push(path);
                     Some((
@@ -322,7 +340,7 @@ impl<T> RouterBuilder<T> {
                             self.errors.push(BuildError::MissingParameterDelimiter(full.into()));
                             return self;
                         } else {
-                            n.set_delimiter(prefix);
+                            n.add_delimiter(prefix);
                         }                        
                     }
 
@@ -341,7 +359,7 @@ impl<T> RouterBuilder<T> {
                             }
 
                             params.get_or_insert_with(Vec::new).push(suffix.into());
-                            node = node.add_parameter_node();
+                            node = node.add_parameter_node(path.is_empty());
                         }
                         None => {
                             self.errors.push(BuildError::UnmatchedBrace(full.into()));
@@ -356,7 +374,7 @@ impl<T> RouterBuilder<T> {
                     }
 
                     if let Some(n) = node.as_mut_parameter_node() {
-                        n.set_delimiter(path);
+                        n.add_delimiter(path);
                     }
 
                     node = node.add_static_node(path[0], path);
